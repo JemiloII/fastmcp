@@ -30,7 +30,7 @@ import { EventEmitter } from "events";
 import { readFile } from "fs/promises";
 import Fuse from "fuse.js";
 import http from "http";
-import { startHTTPServer } from "mcp-proxy";
+import { SSLConfig, startHTTPServer, startHTTPSServer } from "mcp-proxy";
 import { StrictEventEmitter } from "strict-event-emitter-types";
 import { setTimeout as delay } from "timers/promises";
 import { fetch } from "undici";
@@ -2036,7 +2036,9 @@ export class FastMCP<
         enableJsonResponse?: boolean;
         endpoint?: `/${string}`;
         eventStore?: EventStore;
+        host?: string;
         port: number;
+        ssl?: SSLConfig;
         stateless?: boolean;
       };
       transportType: "httpStream" | "stdio";
@@ -2073,12 +2075,14 @@ export class FastMCP<
 
       if (httpConfig.stateless) {
         // Stateless mode - create new server instance for each request
+        const protocol = httpConfig.ssl ? 'https' : 'http';
+        const host = httpConfig.host ?? "localhost";
         this.#logger.info(
-          `[FastMCP info] Starting server in stateless mode on HTTP Stream at http://localhost:${httpConfig.port}${httpConfig.endpoint}`,
+          `[FastMCP info] Starting server in stateless mode on HTTP Stream at ${protocol}://${host}:${httpConfig.port}${httpConfig.endpoint}`,
         );
 
-        this.#httpStreamServer = await startHTTPServer<FastMCPSession<T>>({
-          createServer: async (request) => {
+        const serverConfig = {
+          createServer: async (request: http.IncomingMessage) => {
             let auth: T | undefined;
 
             if (this.#authenticate) {
@@ -2091,6 +2095,7 @@ export class FastMCP<
           },
           enableJsonResponse: httpConfig.enableJsonResponse,
           eventStore: httpConfig.eventStore,
+          host,
           // In stateless mode, we don't track sessions
           onClose: async () => {
             // No session tracking in stateless mode
@@ -2101,17 +2106,26 @@ export class FastMCP<
               `[FastMCP debug] Stateless HTTP Stream request handled`,
             );
           },
-          onUnhandledRequest: async (req, res) => {
+          onUnhandledRequest: async (req: http.IncomingMessage, res: http.ServerResponse) => {
             await this.#handleUnhandledRequest(req, res, true);
           },
           port: httpConfig.port,
           stateless: true,
           streamEndpoint: httpConfig.endpoint,
-        });
+        };
+
+        this.#httpStreamServer = httpConfig.ssl
+          ? await startHTTPSServer<FastMCPSession<T>>({
+              ...serverConfig,
+              ssl: httpConfig.ssl,
+            })
+          : await startHTTPServer<FastMCPSession<T>>(serverConfig);
       } else {
         // Regular mode with session management
-        this.#httpStreamServer = await startHTTPServer<FastMCPSession<T>>({
-          createServer: async (request) => {
+        const protocol = httpConfig.ssl ? 'https' : 'http';
+        const host = httpConfig.host ?? "localhost";
+        const serverConfig = {
+          createServer: async (request: http.IncomingMessage) => {
             let auth: T | undefined;
 
             if (this.#authenticate) {
@@ -2122,12 +2136,13 @@ export class FastMCP<
           },
           enableJsonResponse: httpConfig.enableJsonResponse,
           eventStore: httpConfig.eventStore,
-          onClose: async (session) => {
+          host,
+          onClose: async (session: FastMCPSession<T>) => {
             this.emit("disconnect", {
               session: session as FastMCPSession<FastMCPSessionAuth>,
             });
           },
-          onConnect: async (session) => {
+          onConnect: async (session: FastMCPSession<T>) => {
             this.#sessions.push(session);
 
             this.#logger.info(`[FastMCP info] HTTP Stream session established`);
@@ -2137,15 +2152,22 @@ export class FastMCP<
             });
           },
 
-          onUnhandledRequest: async (req, res) => {
+          onUnhandledRequest: async (req: http.IncomingMessage, res: http.ServerResponse) => {
             await this.#handleUnhandledRequest(req, res, false);
           },
           port: httpConfig.port,
           streamEndpoint: httpConfig.endpoint,
-        });
+        };
+
+        this.#httpStreamServer = httpConfig.ssl
+          ? await startHTTPSServer<FastMCPSession<T>>({
+              ...serverConfig,
+              ssl: httpConfig.ssl,
+            })
+          : await startHTTPServer<FastMCPSession<T>>(serverConfig);
 
         this.#logger.info(
-          `[FastMCP info] server is running on HTTP Stream at http://localhost:${httpConfig.port}${httpConfig.endpoint}`,
+          `[FastMCP info] server is running on HTTP Stream at ${protocol}://${host}:${httpConfig.port}${httpConfig.endpoint}`,
         );
         this.#logger.info(
           `[FastMCP info] Transport type: httpStream (Streamable HTTP, not SSE)`,
@@ -2311,7 +2333,10 @@ export class FastMCP<
       httpStream: {
         enableJsonResponse?: boolean;
         endpoint?: `/${string}`;
+        eventStore?: EventStore;
+        host?: string;
         port: number;
+        ssl?: SSLConfig;
         stateless?: boolean;
       };
       transportType: "httpStream" | "stdio";
@@ -2322,7 +2347,9 @@ export class FastMCP<
           enableJsonResponse?: boolean;
           endpoint: `/${string}`;
           eventStore?: EventStore;
+          host?: string;
           port: number;
+          ssl?: SSLConfig;
           stateless?: boolean;
         };
         transportType: "httpStream";
@@ -2372,7 +2399,10 @@ export class FastMCP<
         httpStream: {
           enableJsonResponse,
           endpoint: endpoint as `/${string}`,
+          eventStore: overrides?.httpStream?.eventStore,
+          host: overrides?.httpStream?.host,
           port,
+          ssl: overrides?.httpStream?.ssl,
           stateless,
         },
         transportType: "httpStream" as const,
