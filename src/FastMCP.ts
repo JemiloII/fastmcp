@@ -200,6 +200,9 @@ export const audioContent = async (
 };
 
 type Context<T extends FastMCPSessionAuth> = {
+  client: {
+    version: ReturnType<Server["getClientVersion"]>;
+  };
   log: {
     debug: (message: string, data?: SerializableValue) => void;
     error: (message: string, data?: SerializableValue) => void;
@@ -207,7 +210,19 @@ type Context<T extends FastMCPSessionAuth> = {
     warn: (message: string, data?: SerializableValue) => void;
   };
   reportProgress: (progress: Progress) => Promise<void>;
+  /**
+   * Request ID from the current MCP request.
+   * Available for all transports when the client provides it.
+   */
+  requestId?: string;
   session: T | undefined;
+  /**
+   * Session ID from the Mcp-Session-Id header.
+   * Only available for HTTP-based transports (SSE, HTTP Stream).
+   * Can be used to track per-session state, implement session-specific
+   * counters, or maintain user-specific data across multiple requests.
+   */
+  sessionId?: string;
   streamContent: (content: Content | Content[]) => Promise<void>;
 };
 
@@ -909,12 +924,17 @@ const FastMCPSessionEventEmitterBase: {
   new (): StrictEventEmitter<EventEmitter, FastMCPSessionEvents>;
 } = EventEmitter;
 
+export enum ServerState {
+  Error = "error",
+  Running = "running",
+  Stopped = "stopped",
+}
+
 type Authenticate<T> = (request: http.IncomingMessage) => Promise<T>;
 
 type FastMCPSessionAuth = Record<string, unknown> | undefined;
 
 class FastMCPSessionEventEmitter extends FastMCPSessionEventEmitterBase {}
-
 export class FastMCPSession<
   T extends FastMCPSessionAuth = FastMCPSessionAuth,
 > extends FastMCPSessionEventEmitter {
@@ -932,6 +952,12 @@ export class FastMCPSession<
   }
   public get server(): Server {
     return this.#server;
+  }
+  public get sessionId(): string | undefined {
+    return this.#sessionId;
+  }
+  public set sessionId(value: string | undefined) {
+    this.#sessionId = value;
   }
   #auth: T | undefined;
   #capabilities: ServerCapabilities = {};
@@ -956,6 +982,12 @@ export class FastMCPSession<
 
   #server: Server;
 
+  /**
+   * Session ID from the Mcp-Session-Id header (HTTP transports only).
+   * Used to track per-session state across multiple requests.
+   */
+  #sessionId?: string;
+
   #utils?: ServerOptions<T>["utils"];
 
   constructor({
@@ -968,6 +1000,7 @@ export class FastMCPSession<
     resources,
     resourcesTemplates,
     roots,
+    sessionId,
     tools,
     transportType,
     utils,
@@ -982,6 +1015,7 @@ export class FastMCPSession<
     resources: Resource<T>[];
     resourcesTemplates: InputResourceTemplate<T>[];
     roots?: ServerOptions<T>["roots"];
+    sessionId?: string;
     tools: Tool<T>[];
     transportType?: "httpStream" | "stdio";
     utils?: ServerOptions<T>["utils"];
@@ -993,6 +1027,7 @@ export class FastMCPSession<
     this.#logger = logger;
     this.#pingConfig = ping;
     this.#rootsConfig = roots;
+    this.#sessionId = sessionId;
     this.#needsEventLoopFlush = transportType === "httpStream";
 
     if (tools.length) {
@@ -1074,6 +1109,16 @@ export class FastMCPSession<
     try {
       await this.#server.connect(transport);
 
+      // Extract session ID from transport if available (HTTP transports only)
+      if ("sessionId" in transport) {
+        const transportWithSessionId = transport as {
+          sessionId?: string;
+        } & Transport;
+        if (typeof transportWithSessionId.sessionId === "string") {
+          this.#sessionId = transportWithSessionId.sessionId;
+        }
+      }
+
       let attempt = 0;
       const maxAttempts = 10;
       const retryDelay = 100;
@@ -1096,6 +1141,7 @@ export class FastMCPSession<
       }
 
       if (
+        this.#rootsConfig?.enabled !== false &&
         this.#clientCapabilities?.roots?.listChanged &&
         typeof this.#server.listRoots === "function"
       ) {
@@ -1161,11 +1207,60 @@ export class FastMCPSession<
     }
   }
 
+  promptsListChanged(prompts: Prompt<T>[]) {
+    this.#prompts = [];
+    for (const prompt of prompts) {
+      this.addPrompt(prompt);
+    }
+    this.setupPromptHandlers(prompts);
+    this.triggerListChangedNotification("notifications/prompts/list_changed");
+  }
+
   public async requestSampling(
     message: z.infer<typeof CreateMessageRequestSchema>["params"],
     options?: RequestOptions,
   ): Promise<SamplingResponse> {
     return this.#server.createMessage(message, options);
+  }
+
+  resourcesListChanged(resources: Resource<T>[]) {
+    this.#resources = [];
+    for (const resource of resources) {
+      this.addResource(resource);
+    }
+    this.setupResourceHandlers(resources);
+    this.triggerListChangedNotification("notifications/resources/list_changed");
+  }
+
+  resourceTemplatesListChanged(resourceTemplates: ResourceTemplate<T>[]) {
+    this.#resourceTemplates = [];
+    for (const resourceTemplate of resourceTemplates) {
+      this.addResourceTemplate(resourceTemplate);
+    }
+    this.setupResourceTemplateHandlers(resourceTemplates);
+    this.triggerListChangedNotification("notifications/resources/list_changed");
+  }
+
+  toolsListChanged(tools: Tool<T>[]) {
+    const allowedTools = tools.filter((tool) =>
+      tool.canAccess ? tool.canAccess(this.#auth as T) : true,
+    );
+    this.setupToolHandlers(allowedTools);
+    this.triggerListChangedNotification("notifications/tools/list_changed");
+  }
+
+  async triggerListChangedNotification(method: string) {
+    try {
+      await this.#server.notification({
+        method,
+      });
+    } catch (error) {
+      this.#logger.error(
+        `[FastMCP error] failed to send ${method} notification.\n\n${
+          error instanceof Error ? error.stack : JSON.stringify(error)
+        }`,
+      );
+    }
   }
 
   public waitForReady(): Promise<void> {
@@ -1388,7 +1483,6 @@ export class FastMCPSession<
       return {};
     });
   }
-
   private setupPromptHandlers(prompts: Prompt<T>[]) {
     this.#server.setRequestHandler(ListPromptsRequestSchema, async () => {
       return {
@@ -1462,7 +1556,6 @@ export class FastMCPSession<
       }
     });
   }
-
   private setupResourceHandlers(resources: Resource<T>[]) {
     this.#server.setRequestHandler(ListResourcesRequestSchema, async () => {
       return {
@@ -1560,7 +1653,6 @@ export class FastMCPSession<
       },
     );
   }
-
   private setupResourceTemplateHandlers(
     resourceTemplates: ResourceTemplate<T>[],
   ) {
@@ -1578,7 +1670,6 @@ export class FastMCPSession<
       },
     );
   }
-
   private setupRootsHandlers() {
     if (this.#rootsConfig?.enabled === false) {
       this.#logger.debug(
@@ -1625,7 +1716,6 @@ export class FastMCPSession<
       );
     }
   }
-
   private setupToolHandlers(tools: Tool<T>[]) {
     this.#server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
@@ -1780,9 +1870,17 @@ export class FastMCPSession<
         };
 
         const executeToolPromise = tool.execute(args, {
+          client: {
+            version: this.#server.getClientVersion(),
+          },
           log,
           reportProgress,
+          requestId:
+            typeof request.params?._meta?.requestId === "string"
+              ? request.params._meta.requestId
+              : undefined,
           session: this.#auth,
+          sessionId: this.#sessionId,
           streamContent,
         });
 
@@ -1838,6 +1936,7 @@ export class FastMCPSession<
           return {
             content: [{ text: error.message, type: "text" }],
             isError: true,
+            ...(error.extras ? { structuredContent: error.extras } : {}),
           };
         }
 
@@ -1891,6 +1990,10 @@ class FastMCPEventEmitter extends FastMCPEventEmitterBase {}
 export class FastMCP<
   T extends FastMCPSessionAuth = FastMCPSessionAuth,
 > extends FastMCPEventEmitter {
+  public get serverState(): ServerState {
+    return this.#serverState;
+  }
+
   public get sessions(): FastMCPSession<T>[] {
     return this.#sessions;
   }
@@ -1901,6 +2004,8 @@ export class FastMCP<
   #prompts: InputPrompt<T>[] = [];
   #resources: Resource<T>[] = [];
   #resourcesTemplates: InputResourceTemplate<T>[] = [];
+  #serverState: ServerState = ServerState.Stopped;
+
   #sessions: FastMCPSession<T>[] = [];
 
   #tools: Tool<T>[] = [];
@@ -1919,30 +2024,108 @@ export class FastMCP<
   public addPrompt<const Args extends InputPromptArgument<T>[]>(
     prompt: InputPrompt<T, Args>,
   ) {
+    this.#prompts = this.#prompts.filter((p) => p.name !== prompt.name);
     this.#prompts.push(prompt);
+    if (this.#serverState === ServerState.Running) {
+      this.#promptsListChanged(this.#prompts);
+    }
   }
+  /**
+   * Adds prompts to the server.
+   */
+  public addPrompts<const Args extends InputPromptArgument<T>[]>(
+    prompts: InputPrompt<T, Args>[],
+  ) {
+    const newPromptNames = new Set(prompts.map((prompt) => prompt.name));
+    this.#prompts = this.#prompts.filter((p) => !newPromptNames.has(p.name));
+    this.#prompts.push(...prompts);
 
+    if (this.#serverState === ServerState.Running) {
+      this.#promptsListChanged(this.#prompts);
+    }
+  }
   /**
    * Adds a resource to the server.
    */
   public addResource(resource: Resource<T>) {
-    this.#resources.push(resource);
-  }
+    this.#resources = this.#resources.filter((r) => r.name !== resource.name);
 
+    this.#resources.push(resource);
+    if (this.#serverState === ServerState.Running) {
+      this.#resourcesListChanged(this.#resources);
+    }
+  }
+  /**
+   * Adds resources to the server.
+   */
+  public addResources(resources: Resource<T>[]) {
+    const newResourceNames = new Set(
+      resources.map((resource) => resource.name),
+    );
+    this.#resources = this.#resources.filter(
+      (r) => !newResourceNames.has(r.name),
+    );
+    this.#resources.push(...resources);
+
+    if (this.#serverState === ServerState.Running) {
+      this.#resourcesListChanged(this.#resources);
+    }
+  }
   /**
    * Adds a resource template to the server.
    */
   public addResourceTemplate<
     const Args extends InputResourceTemplateArgument[],
   >(resource: InputResourceTemplate<T, Args>) {
-    this.#resourcesTemplates.push(resource);
-  }
+    this.#resourcesTemplates = this.#resourcesTemplates.filter(
+      (t) => t.name !== resource.name,
+    );
 
+    this.#resourcesTemplates.push(resource);
+    if (this.#serverState === ServerState.Running) {
+      this.#resourceTemplatesListChanged(this.#resourcesTemplates);
+    }
+  }
+  /**
+   * Adds resource templates to the server.
+   */
+  public addResourceTemplates<
+    const Args extends InputResourceTemplateArgument[],
+  >(resources: InputResourceTemplate<T, Args>[]) {
+    const newResourceTemplateNames = new Set(
+      resources.map((resource) => resource.name),
+    );
+    this.#resourcesTemplates = this.#resourcesTemplates.filter(
+      (t) => !newResourceTemplateNames.has(t.name),
+    );
+    this.#resourcesTemplates.push(...resources);
+
+    if (this.#serverState === ServerState.Running) {
+      this.#resourceTemplatesListChanged(this.#resourcesTemplates);
+    }
+  }
   /**
    * Adds a tool to the server.
    */
   public addTool<Params extends ToolParameters>(tool: Tool<T, Params>) {
+    // Remove existing tool with the same name
+    this.#tools = this.#tools.filter((t) => t.name !== tool.name);
     this.#tools.push(tool as unknown as Tool<T>);
+    if (this.#serverState === ServerState.Running) {
+      this.#toolsListChanged(this.#tools);
+    }
+  }
+  /**
+   * Adds tools to the server.
+   */
+  public addTools<Params extends ToolParameters>(tools: Tool<T, Params>[]) {
+    const newToolNames = new Set(tools.map((tool) => tool.name));
+    this.#tools = this.#tools.filter((t) => !newToolNames.has(t.name));
+    this.#tools.push(...(tools as unknown as Tool<T>[]));
+
+    if (this.#serverState === ServerState.Running) {
+      this.#toolsListChanged(this.#tools);
+    }
   }
 
   /**
@@ -1980,51 +2163,120 @@ export class FastMCP<
 
     // Try to match against resource templates
     for (const template of this.#resourcesTemplates) {
-      // Check if the URI starts with the template base
-      const templateBase = template.uriTemplate.split("{")[0];
-
-      if (uri.startsWith(templateBase)) {
-        const params: Record<string, string> = {};
-        const templateParts = template.uriTemplate.split("/");
-        const uriParts = uri.split("/");
-
-        for (let i = 0; i < templateParts.length; i++) {
-          const templatePart = templateParts[i];
-
-          if (templatePart?.startsWith("{") && templatePart.endsWith("}")) {
-            const paramName = templatePart.slice(1, -1);
-            const paramValue = uriParts[i];
-
-            if (paramValue) {
-              params[paramName] = paramValue;
-            }
-          }
-        }
-
-        const result = await template.load(
-          params as ResourceTemplateArgumentsToObject<
-            typeof template.arguments
-          >,
-        );
-
-        const resourceData: ResourceContent["resource"] = {
-          mimeType: template.mimeType,
-          uri,
-        };
-
-        if ("text" in result) {
-          resourceData.text = result.text;
-        }
-
-        if ("blob" in result) {
-          resourceData.blob = result.blob;
-        }
-
-        return resourceData; // The resource we're looking for
+      const parsedTemplate = parseURITemplate(template.uriTemplate);
+      const params = parsedTemplate.fromUri(uri);
+      if (!params) {
+        continue;
       }
+
+      const result = await template.load(
+        params as ResourceTemplateArgumentsToObject<typeof template.arguments>,
+      );
+
+      const resourceData: ResourceContent["resource"] = {
+        mimeType: template.mimeType,
+        uri,
+      };
+
+      if ("text" in result) {
+        resourceData.text = result.text;
+      }
+
+      if ("blob" in result) {
+        resourceData.blob = result.blob;
+      }
+
+      return resourceData; // The resource we're looking for
     }
 
     throw new UnexpectedStateError(`Resource not found: ${uri}`, { uri });
+  }
+  /**
+   * Removes a prompt from the server.
+   */
+  public removePrompt(name: string) {
+    this.#prompts = this.#prompts.filter((p) => p.name !== name);
+    if (this.#serverState === ServerState.Running) {
+      this.#promptsListChanged(this.#prompts);
+    }
+  }
+  /**
+   * Removes prompts from the server.
+   */
+  public removePrompts(names: string[]) {
+    for (const name of names) {
+      this.#prompts = this.#prompts.filter((p) => p.name !== name);
+    }
+    if (this.#serverState === ServerState.Running) {
+      this.#promptsListChanged(this.#prompts);
+    }
+  }
+  /**
+   * Removes a resource from the server.
+   */
+  public removeResource(name: string) {
+    this.#resources = this.#resources.filter((r) => r.name !== name);
+    if (this.#serverState === ServerState.Running) {
+      this.#resourcesListChanged(this.#resources);
+    }
+  }
+
+  /**
+   * Removes resources from the server.
+   */
+  public removeResources(names: string[]) {
+    for (const name of names) {
+      this.#resources = this.#resources.filter((r) => r.name !== name);
+    }
+    if (this.#serverState === ServerState.Running) {
+      this.#resourcesListChanged(this.#resources);
+    }
+  }
+  /**
+   * Removes a resource template from the server.
+   */
+  public removeResourceTemplate(name: string) {
+    this.#resourcesTemplates = this.#resourcesTemplates.filter(
+      (t) => t.name !== name,
+    );
+    if (this.#serverState === ServerState.Running) {
+      this.#resourceTemplatesListChanged(this.#resourcesTemplates);
+    }
+  }
+  /**
+   * Removes resource templates from the server.
+   */
+  public removeResourceTemplates(names: string[]) {
+    for (const name of names) {
+      this.#resourcesTemplates = this.#resourcesTemplates.filter(
+        (t) => t.name !== name,
+      );
+    }
+    if (this.#serverState === ServerState.Running) {
+      this.#resourceTemplatesListChanged(this.#resourcesTemplates);
+    }
+  }
+  /**
+   * Removes a tool from the server.
+   */
+  public removeTool(name: string) {
+    // Remove existing tool with the same name
+    this.#tools = this.#tools.filter((t) => t.name !== name);
+    if (this.#serverState === ServerState.Running) {
+      this.#toolsListChanged(this.#tools);
+    }
+  }
+
+  /**
+   * Removes tools from the server.
+   */
+  public removeTools(names: string[]) {
+    for (const name of names) {
+      this.#tools = this.#tools.filter((t) => t.name !== name);
+    }
+    if (this.#serverState === ServerState.Running) {
+      this.#toolsListChanged(this.#tools);
+    }
   }
 
   /**
@@ -2048,7 +2300,27 @@ export class FastMCP<
 
     if (config.transportType === "stdio") {
       const transport = new StdioServerTransport();
+
+      // For stdio transport, if authenticate function is provided, call it
+      // with undefined request (since stdio doesn't have HTTP request context)
+      let auth: T | undefined;
+
+      if (this.#authenticate) {
+        try {
+          auth = await this.#authenticate(
+            undefined as unknown as http.IncomingMessage,
+          );
+        } catch (error) {
+          this.#logger.error(
+            "[FastMCP error] Authentication failed for stdio transport:",
+            error instanceof Error ? error.message : String(error),
+          );
+          // Continue without auth if authentication fails
+        }
+      }
+
       const session = new FastMCPSession<T>({
+        auth,
         instructions: this.#options.instructions,
         logger: this.#logger,
         name: this.#options.name,
@@ -2067,35 +2339,78 @@ export class FastMCP<
 
       this.#sessions.push(session);
 
+      session.once("error", () => {
+        this.#removeSession(session);
+      });
+
+      // Monitor the underlying transport for close events
+      if (transport.onclose) {
+        const originalOnClose = transport.onclose;
+
+        transport.onclose = () => {
+          this.#removeSession(session);
+
+          if (originalOnClose) {
+            originalOnClose();
+          }
+        };
+      } else {
+        transport.onclose = () => {
+          this.#removeSession(session);
+        };
+      }
+
       this.emit("connect", {
         session: session as FastMCPSession<FastMCPSessionAuth>,
       });
+      this.#serverState = ServerState.Running;
     } else if (config.transportType === "httpStream") {
       const httpConfig = config.httpStream;
 
       if (httpConfig.stateless) {
         // Stateless mode - create new server instance for each request
         const protocol = httpConfig.ssl ? 'https' : 'http';
-        const host = httpConfig.host ?? "localhost";
         this.#logger.info(
-          `[FastMCP info] Starting server in stateless mode on HTTP Stream at ${protocol}://${host}:${httpConfig.port}${httpConfig.endpoint}`,
+          `[FastMCP info] Starting server in stateless mode on HTTP Stream at ${protocol}://${httpConfig.host}:${httpConfig.port}${httpConfig.endpoint}`,
         );
 
         const serverConfig = {
+          ...(this.#authenticate ? { authenticate: this.#authenticate } : {}),
           createServer: async (request: http.IncomingMessage) => {
             let auth: T | undefined;
 
             if (this.#authenticate) {
               auth = await this.#authenticate(request);
+
+              // In stateless mode, authentication is REQUIRED
+              // mcp-proxy will catch this error and return 401
+              if (auth === undefined || auth === null) {
+                throw new Error("Authentication required");
+              }
             }
+
+            // Extract session ID from headers
+            const sessionId = Array.isArray(request.headers["mcp-session-id"])
+              ? request.headers["mcp-session-id"][0]
+              : request.headers["mcp-session-id"];
 
             // In stateless mode, create a new session for each request
             // without persisting it in the sessions array
-            return this.#createSession(auth);
+            return this.#createSession(auth, sessionId);
           },
           enableJsonResponse: httpConfig.enableJsonResponse,
           eventStore: httpConfig.eventStore,
-          host,
+          host: httpConfig.host,
+          ...(this.#options.oauth?.enabled &&
+          this.#options.oauth.protectedResource?.resource
+            ? {
+                oauth: {
+                  protectedResource: {
+                    resource: this.#options.oauth.protectedResource.resource,
+                  },
+                },
+              }
+            : {}),
           // In stateless mode, we don't track sessions
           onClose: async () => {
             // No session tracking in stateless mode
@@ -2107,7 +2422,7 @@ export class FastMCP<
             );
           },
           onUnhandledRequest: async (req: http.IncomingMessage, res: http.ServerResponse) => {
-            await this.#handleUnhandledRequest(req, res, true);
+            await this.#handleUnhandledRequest(req, res, true, httpConfig.host);
           },
           port: httpConfig.port,
           stateless: true,
@@ -2123,8 +2438,8 @@ export class FastMCP<
       } else {
         // Regular mode with session management
         const protocol = httpConfig.ssl ? 'https' : 'http';
-        const host = httpConfig.host ?? "localhost";
         const serverConfig = {
+          ...(this.#authenticate ? { authenticate: this.#authenticate } : {}),
           createServer: async (request: http.IncomingMessage) => {
             let auth: T | undefined;
 
@@ -2132,12 +2447,31 @@ export class FastMCP<
               auth = await this.#authenticate(request);
             }
 
-            return this.#createSession(auth);
+            // Extract session ID from headers
+            const sessionId = Array.isArray(request.headers["mcp-session-id"])
+              ? request.headers["mcp-session-id"][0]
+              : request.headers["mcp-session-id"];
+
+            return this.#createSession(auth, sessionId);
           },
           enableJsonResponse: httpConfig.enableJsonResponse,
           eventStore: httpConfig.eventStore,
-          host,
+          host: httpConfig.host,
+          ...(this.#options.oauth?.enabled &&
+          this.#options.oauth.protectedResource?.resource
+            ? {
+                oauth: {
+                  protectedResource: {
+                    resource: this.#options.oauth.protectedResource.resource,
+                  },
+                },
+              }
+            : {}),
           onClose: async (session: FastMCPSession<T>) => {
+            const sessionIndex = this.#sessions.indexOf(session);
+
+            if (sessionIndex !== -1) this.#sessions.splice(sessionIndex, 1);
+
             this.emit("disconnect", {
               session: session as FastMCPSession<FastMCPSessionAuth>,
             });
@@ -2153,9 +2487,15 @@ export class FastMCP<
           },
 
           onUnhandledRequest: async (req: http.IncomingMessage, res: http.ServerResponse) => {
-            await this.#handleUnhandledRequest(req, res, false);
+            await this.#handleUnhandledRequest(
+              req,
+              res,
+              false,
+              httpConfig.host,
+            );
           },
           port: httpConfig.port,
+          stateless: httpConfig.stateless,
           streamEndpoint: httpConfig.endpoint,
         };
 
@@ -2167,12 +2507,10 @@ export class FastMCP<
           : await startHTTPServer<FastMCPSession<T>>(serverConfig);
 
         this.#logger.info(
-          `[FastMCP info] server is running on HTTP Stream at ${protocol}://${host}:${httpConfig.port}${httpConfig.endpoint}`,
-        );
-        this.#logger.info(
-          `[FastMCP info] Transport type: httpStream (Streamable HTTP, not SSE)`,
+          `[FastMCP info] server is running on HTTP Stream at ${protocol}://${httpConfig.host}:${httpConfig.port}${httpConfig.endpoint}`,
         );
       }
+      this.#serverState = ServerState.Running;
     } else {
       throw new Error("Invalid transport type");
     }
@@ -2185,13 +2523,29 @@ export class FastMCP<
     if (this.#httpStreamServer) {
       await this.#httpStreamServer.close();
     }
+    this.#serverState = ServerState.Stopped;
   }
 
   /**
    * Creates a new FastMCPSession instance with the current configuration.
    * Used both for regular sessions and stateless requests.
    */
-  #createSession(auth?: T): FastMCPSession<T> {
+  #createSession(auth?: T, sessionId?: string): FastMCPSession<T> {
+    // Check if authentication failed
+    if (
+      auth &&
+      typeof auth === "object" &&
+      "authenticated" in auth &&
+      !(auth as { authenticated: unknown }).authenticated
+    ) {
+      const errorMessage =
+        "error" in auth &&
+        typeof (auth as { error: unknown }).error === "string"
+          ? (auth as { error: string }).error
+          : "Authentication failed";
+      throw new Error(errorMessage);
+    }
+
     const allowedTools = auth
       ? this.#tools.filter((tool) =>
           tool.canAccess ? tool.canAccess(auth) : true,
@@ -2199,6 +2553,7 @@ export class FastMCP<
       : this.#tools;
     return new FastMCPSession<T>({
       auth,
+      instructions: this.#options.instructions,
       logger: this.#logger,
       name: this.#options.name,
       ping: this.#options.ping,
@@ -2206,6 +2561,7 @@ export class FastMCP<
       resources: this.#resources,
       resourcesTemplates: this.#resourcesTemplates,
       roots: this.#options.roots,
+      sessionId,
       tools: allowedTools,
       transportType: "httpStream",
       utils: this.#options.utils,
@@ -2220,6 +2576,7 @@ export class FastMCP<
     req: http.IncomingMessage,
     res: http.ServerResponse,
     isStateless = false,
+    host: string,
   ) => {
     const healthConfig = this.#options.health ?? {};
 
@@ -2228,7 +2585,7 @@ export class FastMCP<
 
     if (enabled) {
       const path = healthConfig.path ?? "/health";
-      const url = new URL(req.url || "", "http://localhost");
+      const url = new URL(req.url || "", `http://${host}`);
 
       try {
         if (req.method === "GET" && url.pathname === path) {
@@ -2292,7 +2649,7 @@ export class FastMCP<
     // Handle OAuth well-known endpoints
     const oauthConfig = this.#options.oauth;
     if (oauthConfig?.enabled && req.method === "GET") {
-      const url = new URL(req.url || "", "http://localhost");
+      const url = new URL(req.url || "", `http://${host}`);
 
       if (
         url.pathname === "/.well-known/oauth-authorization-server" &&
@@ -2328,6 +2685,7 @@ export class FastMCP<
     // If the request was not handled above, return 404
     res.writeHead(404).end();
   };
+
   #parseRuntimeConfig(
     overrides?: Partial<{
       httpStream: {
@@ -2368,12 +2726,13 @@ export class FastMCP<
     const portArg = getArg("port");
     const endpointArg = getArg("endpoint");
     const statelessArg = getArg("stateless");
+    const hostArg = getArg("host");
 
     const envTransport = process.env.FASTMCP_TRANSPORT;
     const envPort = process.env.FASTMCP_PORT;
     const envEndpoint = process.env.FASTMCP_ENDPOINT;
     const envStateless = process.env.FASTMCP_STATELESS;
-
+    const envHost = process.env.FASTMCP_HOST;
     // Overrides > CLI > env > defaults
     const transportType =
       overrides?.transportType ||
@@ -2385,6 +2744,8 @@ export class FastMCP<
       const port = parseInt(
         overrides?.httpStream?.port?.toString() || portArg || envPort || "8080",
       );
+      const host =
+        overrides?.httpStream?.host || hostArg || envHost || "localhost";
       const endpoint =
         overrides?.httpStream?.endpoint || endpointArg || envEndpoint || "/mcp";
       const enableJsonResponse =
@@ -2411,7 +2772,52 @@ export class FastMCP<
 
     return { transportType: "stdio" as const };
   }
+
+  /**
+   * Notifies all sessions that the prompts list has changed.
+   */
+  #promptsListChanged(prompts: Prompt<T>[]) {
+    for (const session of this.#sessions) {
+      session.promptsListChanged(prompts);
+    }
+  }
+  #removeSession(session: FastMCPSession<T>): void {
+    const sessionIndex = this.#sessions.indexOf(session);
+
+    if (sessionIndex !== -1) {
+      this.#sessions.splice(sessionIndex, 1);
+      this.emit("disconnect", {
+        session: session as FastMCPSession<FastMCPSessionAuth>,
+      });
+    }
+  }
+  /**
+   * Notifies all sessions that the resources list has changed.
+   */
+  #resourcesListChanged(resources: Resource<T>[]) {
+    for (const session of this.#sessions) {
+      session.resourcesListChanged(resources);
+    }
+  }
+  /**
+   * Notifies all sessions that the resource templates list has changed.
+   */
+  #resourceTemplatesListChanged(templates: InputResourceTemplate<T>[]) {
+    for (const session of this.#sessions) {
+      session.resourceTemplatesListChanged(templates);
+    }
+  }
+  /**
+   * Notifies all sessions that the tools list has changed.
+   */
+  #toolsListChanged(tools: Tool<T>[]) {
+    for (const session of this.#sessions) {
+      session.toolsListChanged(tools);
+    }
+  }
 }
+
+export { DiscoveryDocumentCache } from "./DiscoveryDocumentCache.js";
 
 export type {
   AudioContent,
