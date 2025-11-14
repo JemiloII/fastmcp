@@ -27,6 +27,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { StandardSchemaV1 } from "@standard-schema/spec";
 import { EventEmitter } from "events";
+import { readFileSync } from "fs";
 import { readFile } from "fs/promises";
 import Fuse from "fuse.js";
 import http from "http";
@@ -35,6 +36,7 @@ import { StrictEventEmitter } from "strict-event-emitter-types";
 import { setTimeout as delay } from "timers/promises";
 import { fetch } from "undici";
 import parseURITemplate from "uri-templates";
+import { fileURLToPath} from "url";
 import { toJsonSchema } from "xsschema";
 import { z } from "zod";
 
@@ -2364,12 +2366,13 @@ export class FastMCP<
         session: session as FastMCPSession<FastMCPSessionAuth>,
       });
       this.#serverState = ServerState.Running;
-    } else if (config.transportType === "httpStream") {
+    }
+    else if (config.transportType === "httpStream") {
       const httpConfig = config.httpStream;
 
       if (httpConfig.stateless) {
         // Stateless mode - create new server instance for each request
-        const protocol = httpConfig.ssl ? 'https' : 'http';
+        const protocol = httpConfig.ssl ? "https" : "http";
         this.#logger.info(
           `[FastMCP info] Starting server in stateless mode on HTTP Stream at ${protocol}://${httpConfig.host}:${httpConfig.port}${httpConfig.endpoint}`,
         );
@@ -2437,7 +2440,7 @@ export class FastMCP<
           : await startHTTPServer<FastMCPSession<T>>(serverConfig);
       } else {
         // Regular mode with session management
-        const protocol = httpConfig.ssl ? 'https' : 'http';
+        const protocol = httpConfig.ssl ? "https" : "http";
         const serverConfig = {
           ...(this.#authenticate ? { authenticate: this.#authenticate } : {}),
           createServer: async (request: http.IncomingMessage) => {
@@ -2511,7 +2514,8 @@ export class FastMCP<
         );
       }
       this.#serverState = ServerState.Running;
-    } else {
+    }
+    else {
       throw new Error("Invalid transport type");
     }
   }
@@ -2570,6 +2574,18 @@ export class FastMCP<
   }
 
   /**
+   * Gets arguments from the cli
+   */
+  #getArg(name: string) {
+    const args = process.argv.slice(2);
+    const index = args.findIndex((arg) => arg === `--${name}`);
+
+    return index !== -1 && index + 1 < args.length
+      ? args[index + 1]
+      : undefined;
+  }
+
+  /**
    * Handles unhandled HTTP requests with health, readiness, and OAuth endpoints
    */
   #handleUnhandledRequest = async (
@@ -2578,6 +2594,9 @@ export class FastMCP<
     isStateless = false,
     host: string,
   ) => {
+    const sslArg = this.#getArg("ssl")
+    const envSSL = process.env.FASTMCP_SSL;
+    const protocol = (sslArg || envSSL) === "true" ? "https" : "http";
     const healthConfig = this.#options.health ?? {};
 
     const enabled =
@@ -2649,7 +2668,7 @@ export class FastMCP<
     // Handle OAuth well-known endpoints
     const oauthConfig = this.#options.oauth;
     if (oauthConfig?.enabled && req.method === "GET") {
-      const url = new URL(req.url || "", `http://${host}`);
+      const url = new URL(req.url || "", `${protocol}://${host}`);
 
       if (
         url.pathname === "/.well-known/oauth-authorization-server" &&
@@ -2701,38 +2720,38 @@ export class FastMCP<
     }>,
   ):
     | {
-        httpStream: {
-          enableJsonResponse?: boolean;
-          endpoint: `/${string}`;
-          eventStore?: EventStore;
-          host?: string;
-          port: number;
-          ssl?: SSLConfig;
-          stateless?: boolean;
-        };
-        transportType: "httpStream";
-      }
+      httpStream: {
+        enableJsonResponse?: boolean;
+        endpoint: `/${ string }`;
+        eventStore?: EventStore;
+        host: string;
+        port: number;
+        ssl?: SSLConfig;
+        stateless?: boolean;
+      };
+      transportType: "httpStream";
+    }
     | { transportType: "stdio" } {
-    const args = process.argv.slice(2);
-    const getArg = (name: string) => {
-      const index = args.findIndex((arg) => arg === `--${name}`);
+    const transportArg = this.#getArg("transport");
+    const portArg = this.#getArg("port");
+    const endpointArg = this.#getArg("endpoint");
+    const statelessArg = this.#getArg("stateless");
+    const hostArg = this.#getArg("host");
+    const sslArg = this.#getArg("ssl");
+    const certArg = this.#getArg("cert");
+    const keyArg = this.#getArg("key");
 
-      return index !== -1 && index + 1 < args.length
-        ? args[index + 1]
-        : undefined;
-    };
+    const {
+      FASTMCP_ENDPOINT: envEndpoint,
+      FASTMCP_HOST: envHost,
+      FASTMCP_PORT: envPort,
+      FASTMCP_SSL: envSSL,
+      FASTMCP_SSL_CERT: envSSLCert,
+      FASTMCP_SSL_KEY: envSSLKey,
+      FASTMCP_STATELESS: envStateless,
+      FASTMCP_TRANSPORT: envTransport,
+    } = process.env;
 
-    const transportArg = getArg("transport");
-    const portArg = getArg("port");
-    const endpointArg = getArg("endpoint");
-    const statelessArg = getArg("stateless");
-    const hostArg = getArg("host");
-
-    const envTransport = process.env.FASTMCP_TRANSPORT;
-    const envPort = process.env.FASTMCP_PORT;
-    const envEndpoint = process.env.FASTMCP_ENDPOINT;
-    const envStateless = process.env.FASTMCP_STATELESS;
-    const envHost = process.env.FASTMCP_HOST;
     // Overrides > CLI > env > defaults
     const transportType =
       overrides?.transportType ||
@@ -2755,15 +2774,23 @@ export class FastMCP<
         statelessArg === "true" ||
         envStateless === "true" ||
         false;
+      let ssl = overrides?.httpStream?.ssl || sslArg === "true" || envSSL === "true" || false;
+      // Checking for true as overrides will have all cert info
+      if (ssl === true) {
+        ssl = {
+          cert: readFileSync(fileURLToPath(new URL((certArg || envSSLCert) as string, import.meta.url))),
+          key: readFileSync(fileURLToPath(new URL((keyArg || envSSLKey) as string, import.meta.url)))
+        };
+      }
 
       return {
         httpStream: {
           enableJsonResponse,
           endpoint: endpoint as `/${string}`,
           eventStore: overrides?.httpStream?.eventStore,
-          host: overrides?.httpStream?.host,
+          host,
           port,
-          ssl: overrides?.httpStream?.ssl,
+          ssl,
           stateless,
         },
         transportType: "httpStream" as const,

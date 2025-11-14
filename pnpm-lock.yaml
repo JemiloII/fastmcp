@@ -25,7 +25,7 @@ importers:
         version: 7.1.0
       mcp-proxy:
         specifier: github:JemiloII/mcp-proxy
-        version: https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/1bd63906ceb35e152104b749a165efebc6621acc
+        version: https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/6387e250216113609ea5d75581396e298cb1a7b6
       strict-event-emitter-types:
         specifier: ^2.0.0
         version: 2.0.0
@@ -2435,8 +2435,8 @@ packages:
     resolution: {integrity: sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==}
     engines: {node: '>= 0.4'}
 
-  mcp-proxy@https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/1bd63906ceb35e152104b749a165efebc6621acc:
-    resolution: {tarball: https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/1bd63906ceb35e152104b749a165efebc6621acc}
+  mcp-proxy@https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/6387e250216113609ea5d75581396e298cb1a7b6:
+    resolution: {tarball: https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/6387e250216113609ea5d75581396e298cb1a7b6}
     version: 1.0.0
     hasBin: true
 
@@ -5981,13 +5981,7 @@ snapshots:
 
   math-intrinsics@1.1.0: {}
 
-  mcp-proxy@https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/1bd63906ceb35e152104b749a165efebc6621acc:
-    dependencies:
-      '@modelcontextprotocol/sdk': 1.17.2
-      eventsource: 4.0.0
-      yargs: 18.0.0
-    transitivePeerDependencies:
-      - supports-color
+  mcp-proxy@https://codeload.github.com/JemiloII/mcp-proxy/tar.gz/6387e250216113609ea5d75581396e298cb1a7b6: {}
 
   media-typer@1.1.0: {}
 
